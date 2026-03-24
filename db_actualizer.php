@@ -35,6 +35,9 @@ class DbActualizer
     /** @var array */
     private $errors = [];
 
+    /** @var array Таблицы, которые были (или будут) пересозданы в текущем прогоне */
+    private $recreatedTables = [];
+
     public function __construct(string $dbPath, string $sqlFile, bool $dryRun = false, bool $verbose = false)
     {
         $this->sqlFile = $sqlFile;
@@ -190,18 +193,7 @@ class DbActualizer
         $refNames   = array_column($refCols, 'name');
         $existNames = array_column($existCols, 'name');
 
-        // Добавить отсутствующие столбцы
-        foreach ($refCols as $col) {
-            if (!in_array($col['name'], $existNames, true)) {
-                $colDef = $this->buildColumnDef($col);
-                $this->applyChange(
-                    "ADD COLUMN `{$col['name']}` to `{$table}`",
-                    "ALTER TABLE \"{$table}\" ADD COLUMN {$colDef}"
-                );
-            }
-        }
-
-        // Удалить лишние столбцы или изменить тип/умолчание — через пересоздание таблицы
+        // Сначала определяем — нужно ли пересоздание таблицы
         $needsRecreate = false;
         $recreateReasons = [];
 
@@ -217,7 +209,7 @@ class DbActualizer
             foreach ($existCols as $ec) {
                 if ($ec['name'] === $refCol['name']) { $found = $ec; break; }
             }
-            if ($found === null) continue; // уже обработан выше (ADD)
+            if ($found === null) continue; // новый столбец — обрабатывается ниже или через recreation
 
             if (!$this->columnsMatch($refCol, $found)) {
                 $needsRecreate = true;
@@ -226,8 +218,21 @@ class DbActualizer
         }
 
         if ($needsRecreate) {
+            // Пересоздание покрывает и добавление новых столбцов — ADD COLUMN не нужен
             $reason = implode('; ', $recreateReasons);
             $this->recreateTable($table, $refDef, $reason);
+            return;
+        }
+
+        // Пересоздание не нужно — добавляем только отсутствующие столбцы
+        foreach ($refCols as $col) {
+            if (!in_array($col['name'], $existNames, true)) {
+                $colDef = $this->buildColumnDef($col);
+                $this->applyChange(
+                    "ADD COLUMN `{$col['name']}` to `{$table}`",
+                    "ALTER TABLE \"{$table}\" ADD COLUMN {$colDef}"
+                );
+            }
         }
     }
 
@@ -274,6 +279,7 @@ class DbActualizer
                 $this->changes[] = "[DRY-RUN] {$op['msg']}";
                 $this->logVerbose("  [DRY-RUN] {$op['sql']}");
             }
+            $this->recreatedTables[] = $table;
             return;
         }
 
@@ -285,6 +291,7 @@ class DbActualizer
                 $this->logVerbose("  " . $op['sql']);
             }
             $this->db->commit();
+            $this->recreatedTables[] = $table;
         } catch (Exception $e) {
             $this->db->rollBack();
             $this->errors[] = "Ошибка пересоздания таблицы `{$table}`: " . $e->getMessage();
@@ -297,7 +304,10 @@ class DbActualizer
 
     private function syncIndexes(string $table, array $refIndexes): void
     {
-        $existingIndexes = $this->getExistingIndexes($table);
+        // Если таблица была пересоздана — все старые индексы уже удалены вместе с ней
+        $existingIndexes = in_array($table, $this->recreatedTables, true)
+            ? []
+            : $this->getExistingIndexes($table);
 
         // Добавляем отсутствующие
         foreach ($refIndexes as $name => $idx) {
